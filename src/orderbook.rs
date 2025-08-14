@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::order::{Order, Side};
+use crate::types::{BatchProcessor, Op, Order, Side};
+
+/*
+    Core Orderbook implementation.
+*/
 
 // here we assume our oid is sequential, so we can use it as FIFO index
 #[derive(Debug, Clone, Default)]
@@ -8,6 +12,31 @@ pub struct Orderbook {
     pub map: HashMap<u64, Order>,           // oid => order
     pub bids: BTreeMap<u64, BTreeSet<u64>>, // price => level
     pub asks: BTreeMap<u64, BTreeSet<u64>>, // price => level
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderbookSnapshot {
+    pub total_orders: usize,
+    pub total_bids: usize,
+    pub total_asks: usize,
+    pub checksum: u64,
+}
+
+impl BatchProcessor for Orderbook {
+    type Operation = Op;
+    type Snapshot = OrderbookSnapshot;
+
+    // TODO: right now it's a very naive implementation, we can optimize it later
+    fn process_ops(&mut self, ops: Vec<Self::Operation>) {
+        for op in ops {
+            self.process_op(op);
+        }
+    }
+
+    // TODO: this is a placeholder
+    fn produce_snapshot(&self) -> Self::Snapshot {
+        self.clone().into()
+    }
 }
 
 impl Orderbook {
@@ -24,6 +53,14 @@ impl Orderbook {
 
     pub fn contains(&self, oid: u64) -> bool {
         self.map.contains_key(&oid)
+    }
+
+    pub fn process_op(&mut self, op: Op) {
+        match op {
+            Op::Add(order) => self.add(order),
+            Op::Remove(oid) => self.remove(oid),
+            Op::Modify { oid, size } => self.modify(oid, size),
+        }
     }
 
     pub fn add(&mut self, mut order: Order) {
@@ -103,7 +140,7 @@ impl Orderbook {
         }
     }
 
-    pub fn remove(&mut self, oid: u64) -> Option<Order> {
+    pub fn remove(&mut self, oid: u64) {
         // Remove the order from the map
         if let Some(order) = self.map.remove(&oid) {
             // Remove the order from the corresponding book
@@ -118,9 +155,7 @@ impl Orderbook {
                     book.remove(&order.price);
                 }
             }
-            return Some(order);
         }
-        None
     }
 
     pub fn modify(&mut self, oid: u64, size: u64) {
@@ -135,10 +170,29 @@ impl Orderbook {
     }
 }
 
+impl From<Orderbook> for OrderbookSnapshot {
+    fn from(orderbook: Orderbook) -> Self {
+        let total_orders = orderbook.map.len();
+        let total_bids = orderbook.bids.len();
+        let total_asks = orderbook.asks.len();
+        let checksum = orderbook
+            .map
+            .values()
+            .fold(0u64, |acc, order| acc.wrapping_add(order.oid));
+
+        OrderbookSnapshot {
+            total_orders,
+            total_bids,
+            total_asks,
+            checksum,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::order::{Order, Side};
+    use crate::types::{Order, Side};
 
     #[test]
     fn test_orderbook_add() {
