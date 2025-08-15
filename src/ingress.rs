@@ -4,7 +4,7 @@ use crossbeam_channel::Sender;
 
 use crate::{
     error::Error,
-    types::{BackPressureStrategy, BatchProcessor, Command},
+    types::{BackPressureStrategy, BatchProcessor, Command, Query},
 };
 
 /*
@@ -13,6 +13,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct IngressConfig {
+    pub query_channel_size: usize,
     pub max_delay_ms: Duration,
     pub buffer_size: usize,
     pub batch_size: usize,
@@ -36,12 +37,12 @@ impl<T> Producer<T> {
         Self { sender, config }
     }
 
-    pub fn send(&self, command: Command<T>) -> Result<(), Error<T>> {
+    pub fn send(&self, command: Command<T>) -> Result<(), Error> {
         match self.config.back_pressure_strategy {
             BackPressureStrategy::Block => self.sender.send(command)?, // Block until the command is sent
             BackPressureStrategy::Drop => match self.sender.try_send(command) {
                 Ok(_) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
-                Err(e) => return Err(Error::TrySendError(e)),
+                Err(e) => return Err(Error::SendError(e.to_string())),
             },
         }
 
@@ -50,7 +51,7 @@ impl<T> Producer<T> {
 }
 
 impl<T> Controller<T> {
-    pub fn shutdown(&mut self) -> Result<(), Error<T>> {
+    pub fn shutdown(&mut self) -> Result<(), Error> {
         if let Some(handle) = self.handle.take() {
             self.sender.send(Command::Shutdown)?;
             handle.join().map_err(|_| Error::JoinError)?;
@@ -62,39 +63,49 @@ impl<T> Controller<T> {
 pub fn spawn_processor_thread<P, T>(
     mut processor: P,
     config: IngressConfig,
-) -> (Producer<T>, Controller<T>)
+) -> (Producer<T>, Controller<T>, Sender<Query<P::Snapshot>>)
 where
     P: BatchProcessor<Operation = T> + Send + 'static,
     T: Send + 'static,
 {
     let (tx, rx) = crossbeam_channel::bounded(config.buffer_size);
+    let (query_tx, query_rx) = crossbeam_channel::bounded(config.query_channel_size);
     let producer = Producer::new(tx.clone(), config.clone());
+
     let handle = std::thread::spawn(move || {
-        // For now we only batch up the add commands
         let mut batch = Vec::with_capacity(config.batch_size);
         let mut last_flush = std::time::Instant::now();
         loop {
-            let timeout = config.max_delay_ms.saturating_sub(last_flush.elapsed());
-            match rx.recv_timeout(timeout) {
-                Ok(Command::Shutdown) => {
-                    let snapshot = processor.produce_snapshot();
-                    println!("Final snapshot: {snapshot:#?}");
-                    break;
-                }
-                Ok(Command::Operation(op)) => {
-                    batch.push(op);
-                    if batch.len() >= config.batch_size {
-                        processor.process_ops(std::mem::take(&mut batch));
-                        last_flush = std::time::Instant::now();
+            crossbeam_channel::select! {
+                recv(rx) -> command => match command {
+                    Ok(Command::Shutdown) => {
+                        if !batch.is_empty() {
+                            processor.process_ops(std::mem::take(&mut batch));
+                        }
+                        break;
                     }
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    if !batch.is_empty() {
-                        processor.process_ops(std::mem::take(&mut batch));
-                        last_flush = std::time::Instant::now();
+                    Ok(Command::Operation(op)) => {
+                        batch.push(op);
+                        if batch.len() >= config.batch_size {
+                            processor.process_ops(std::mem::take(&mut batch));
+                            last_flush = std::time::Instant::now();
+                        }
                     }
+                    Err(crossbeam_channel::RecvError) => break,
+                },
+                recv(query_rx) -> query => match query {
+                    Ok(q) => {
+                        if let Err(e) = processor.process_query(q) {
+                            eprintln!("Error processing query: {}", e);
+                        }
+                    }
+                    Err(crossbeam_channel::RecvError) => break,
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+
+            if last_flush.elapsed() >= config.max_delay_ms && !batch.is_empty() {
+                processor.process_ops(std::mem::take(&mut batch));
+                last_flush = std::time::Instant::now();
             }
         }
     });
@@ -104,5 +115,5 @@ where
         handle: Some(handle),
     };
 
-    (producer, controller)
+    (producer, controller, query_tx)
 }

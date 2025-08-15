@@ -3,28 +3,60 @@ use std::io::Write as _;
 use ob3::{
     ingress::spawn_processor_thread,
     orderbook::Orderbook,
-    types::{Command, Op, Order, Side},
+    types::{BackPressureStrategy, Command, Op, Order, Side},
 };
 
+// Our nice looking spinner
 const SPINNER: &[&str] = &["|", "/", "-", "\\"];
+
+// ---- Config for ob3 (change this to test different strategies) ----
+// The query channel size
+const QUERY_CHANNEL_SIZE: usize = 100;
+// The maximum delay in milliseconds for processing commands
+const MAX_DELAY_MS: u64 = 50;
+// The size of the ingress command buffer channel.
+const BUFFER_SIZE: usize = 1_000;
+// The maximum number of operations to process in a single batch.
+const BATCH_SIZE: usize = 100;
+// The strategy to use when the command buffer is full.
+const BACK_PRESSURE_STRATEGY: BackPressureStrategy = BackPressureStrategy::Block;
+
+// ---- Config for volume (change this to simulate different scenarios) ----
+// Total number of operations to process
+const INGRESS_NUM_TOTAL: usize = 10_000_000;
+// The range of batch sizes for the ingress, this simulates real-world scenarios where volume can vary
+const INGRESS_BATCH_RANGE: (u64, u64) = (1_000, 100_000);
+// Interval between batches in milliseconds
+const INGRESS_BATCH_INTERVAL_MS: u64 = 5;
+// Seed for the batch size random number generator
+const INGRESS_BATCH_SIZE_SEED: u64 = 1042;
+
+// ---- Config for random operation generation (change this to generate new order test data) ----
+// Seed to use for our homemade random number generator to output deterministic results
+const OP_SEED: u64 = 42;
+// The range of price values for orders
+const PRICE_RANGE: (u64, u64) = (1_000, 1_000_000);
+// The range of size values for orders
+const SIZE_RANGE: (u64, u64) = (1_000, 1_000_000_000);
 
 #[tokio::main]
 async fn main() {
-    let ops_len = 10_000_000;
+    let ops_len = INGRESS_NUM_TOTAL;
     // Generate a large number of random operations
-    let mut ops = generate_random_ops(42, ops_len);
+    let mut ops = generate_random_ops(OP_SEED, ops_len);
 
     // Create a channel for sending commands
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Command<Op>>(10_000);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Command<Op>>(INGRESS_BATCH_RANGE.1 as usize);
 
     let orderbook = Orderbook::default();
     let config = ob3::ingress::IngressConfig {
-        max_delay_ms: std::time::Duration::from_millis(50),
-        buffer_size: 1_000,
-        batch_size: 100,
-        back_pressure_strategy: ob3::types::BackPressureStrategy::Block,
+        query_channel_size: QUERY_CHANNEL_SIZE,
+        max_delay_ms: std::time::Duration::from_millis(MAX_DELAY_MS),
+        buffer_size: BUFFER_SIZE,
+        batch_size: BATCH_SIZE,
+        back_pressure_strategy: BACK_PRESSURE_STRATEGY,
     };
-    let (producer, mut controller) = spawn_processor_thread(orderbook, config);
+    let (producer, mut controller, query_sender) = spawn_processor_thread(orderbook, config);
 
     let start = std::time::Instant::now();
     println!("Starting to process {} operations...", ops.len());
@@ -38,10 +70,12 @@ async fn main() {
 
     // Spawn a task to send the operations (to simulate network ingress)
     let sender_task = tokio::spawn(async move {
-        let mut lcg = Lcg { seed: 1042 };
+        let mut lcg = Lcg {
+            seed: INGRESS_BATCH_SIZE_SEED,
+        };
 
         for i in 0..ops_len {
-            let batch_size = lcg.next_range(1, 10_000) as usize; // Random batch size
+            let batch_size = lcg.next_range(INGRESS_BATCH_RANGE.0, INGRESS_BATCH_RANGE.1) as usize;
 
             print!(
                 "\r{} Sending {} operations...",
@@ -59,6 +93,11 @@ async fn main() {
             if ops.is_empty() {
                 break;
             }
+
+            if INGRESS_BATCH_INTERVAL_MS > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(INGRESS_BATCH_INTERVAL_MS))
+                    .await;
+            }
         }
     });
 
@@ -71,6 +110,14 @@ async fn main() {
         "Throughput: {:.2} ops/s",
         ops_len as f64 / elapsed.as_secs_f64()
     );
+
+    let (oneshot_tx, oneshot_rx) = crossbeam_channel::bounded(1);
+    query_sender
+        .send(ob3::types::Query::GetSnapshot(oneshot_tx))
+        .unwrap();
+
+    let snapshot = oneshot_rx.recv().unwrap();
+    println!("Orderbook snapshot: {:?}", snapshot);
     // Shutdown the processor thread
     controller.shutdown().unwrap();
     println!("Processor thread shutdown complete.");
@@ -108,8 +155,8 @@ fn generate_random_ops(seed: u64, count: usize) -> Vec<Op> {
                 // Add
                 let order = Order {
                     oid: i as u64,
-                    price: lcg.next_range(100, 1000),
-                    size: lcg.next_range(1, 100),
+                    price: lcg.next_range(PRICE_RANGE.0, PRICE_RANGE.1),
+                    size: lcg.next_range(SIZE_RANGE.0, SIZE_RANGE.1),
                     side: if lcg.next() % 2 == 0 {
                         Side::Bid
                     } else {
@@ -127,7 +174,7 @@ fn generate_random_ops(seed: u64, count: usize) -> Vec<Op> {
             2 => {
                 // Modify
                 let oid = lcg.next_range(0, i as u64);
-                let size = lcg.next_range(1, 100);
+                let size = lcg.next_range(SIZE_RANGE.0, SIZE_RANGE.1);
                 ops.push(Op::Modify { oid, size });
             }
             _ => unreachable!(),

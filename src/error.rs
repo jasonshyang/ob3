@@ -1,13 +1,28 @@
 use thiserror::Error;
 
-use crate::types::Command;
-
 #[derive(Error, Debug)]
-pub enum Error<T> {
-    #[error("Try Send Error: {0}")]
-    TrySendError(#[from] crossbeam_channel::TrySendError<Command<T>>),
+pub enum Error {
     #[error("Send Error: {0}")]
-    SendError(#[from] crossbeam_channel::SendError<Command<T>>),
+    SendError(String),
     #[error("Couldn't join on the associated thread")]
     JoinError,
+}
+
+impl<T> From<crossbeam_channel::SendError<T>> for Error {
+    fn from(err: crossbeam_channel::SendError<T>) -> Self {
+        Error::SendError(err.to_string())
+    }
+}
+
+impl<T> From<crossbeam_channel::TrySendError<T>> for Error {
+    fn from(err: crossbeam_channel::TrySendError<T>) -> Self {
+        match err {
+            crossbeam_channel::TrySendError::Full(_) => {
+                Error::SendError("Channel is full".to_string())
+            }
+            crossbeam_channel::TrySendError::Disconnected(_) => {
+                Error::SendError("Channel disconnected".to_string())
+            }
+        }
+    }
 }

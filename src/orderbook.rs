@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::types::{BatchProcessor, Op, Order, Side};
+use crate::{
+    error::Error,
+    types::{BatchProcessor, Op, Order, Query, Side},
+};
 
 /*
     Core Orderbook implementation.
@@ -33,9 +36,15 @@ impl BatchProcessor for Orderbook {
         }
     }
 
-    // TODO: this is a placeholder
-    fn produce_snapshot(&self) -> Self::Snapshot {
-        self.clone().into()
+    fn process_query(&self, query: crate::types::Query<Self::Snapshot>) -> Result<(), Error> {
+        let snapshot: OrderbookSnapshot = self.clone().into();
+        match query {
+            Query::GetSnapshot(sender) => {
+                sender.send(snapshot)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -173,8 +182,16 @@ impl Orderbook {
 impl From<Orderbook> for OrderbookSnapshot {
     fn from(orderbook: Orderbook) -> Self {
         let total_orders = orderbook.map.len();
-        let total_bids = orderbook.bids.len();
-        let total_asks = orderbook.asks.len();
+        let total_bids = orderbook
+            .bids
+            .into_iter()
+            .map(|(_, levels)| levels.len())
+            .sum();
+        let total_asks = orderbook
+            .asks
+            .into_iter()
+            .map(|(_, levels)| levels.len())
+            .sum();
         let checksum = orderbook
             .map
             .values()

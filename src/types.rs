@@ -1,10 +1,13 @@
 use std::fmt::Debug;
 
+use crate::error::Error;
+
 pub trait BatchProcessor {
     type Operation;
-    type Snapshot: Debug + Clone;
+    type Snapshot: Debug + Clone + Send;
+
     fn process_ops(&mut self, ops: Vec<Self::Operation>);
-    fn produce_snapshot(&self) -> Self::Snapshot;
+    fn process_query(&self, query: Query<Self::Snapshot>) -> Result<(), Error>;
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +35,11 @@ pub enum BackPressureStrategy {
 pub enum Command<T> {
     Operation(T),
     Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub enum Query<T> {
+    GetSnapshot(crossbeam_channel::Sender<T>),
 }
 
 #[derive(Debug, Clone)]
