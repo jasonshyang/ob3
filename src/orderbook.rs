@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
     error::Error,
-    types::{BatchProcessor, Op, Order, Query, Side},
+    types::{BatchProcessor, Either, Op, Order, Query, Side},
 };
 
 /*
@@ -81,46 +81,28 @@ impl Orderbook {
         // Fill order
         let mut filled = Vec::new();
 
-        match order.side {
-            Side::Bid => {
-                // Iterate through lowest ask price first
-                'outer: for (_, levels) in self.asks.range(..=order.price) {
-                    for &oid in levels {
-                        if let Some(other) = self.map.get_mut(&oid) {
-                            order.fill(other);
-                            // If the order is fully filled, add to filled list for removal
-                            if other.size == 0 {
-                                filled.push(oid);
-                            }
-
-                            // If the order is fully filled, break out of the outer loop
-                            if order.size == 0 {
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-            }
-            Side::Ask => {
-                // Iterate through highest bid price first
-                'outer: for (_, levels) in self.bids.range(order.price..).rev() {
-                    for &oid in levels {
-                        if let Some(other) = self.map.get_mut(&oid) {
-                            order.fill(other);
-                            // If the order is fully filled, add to filled list for removal
-                            if other.size == 0 {
-                                filled.push(oid);
-                            }
-
-                            // If the order is fully filled, break out of the outer loop
-                            if order.size == 0 {
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-            }
+        // Determine the iteration direction based on the order side
+        let iter = match order.side {
+            Side::Bid => Either::Ascending(self.asks.range(..=order.price)),
+            Side::Ask => Either::Descending(self.bids.range(order.price..).rev()),
         };
+
+        'outer: for (_, levels) in iter {
+            for &oid in levels {
+                if let Some(other) = self.map.get_mut(&oid) {
+                    order.fill(other);
+                    // If the order is fully filled, add to filled list for removal
+                    if other.size == 0 {
+                        filled.push(oid);
+                    }
+
+                    // If the order is fully filled, break out of the outer loop
+                    if order.size == 0 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
 
         // Handle the filled orders
         for oid in filled {
@@ -183,15 +165,9 @@ impl From<Orderbook> for OrderbookSnapshot {
     fn from(orderbook: Orderbook) -> Self {
         let total_orders = orderbook.map.len();
         let total_bids = orderbook
-            .bids
-            .into_iter()
-            .map(|(_, levels)| levels.len())
-            .sum();
+            .bids.into_values().map(|levels| levels.len()).sum();
         let total_asks = orderbook
-            .asks
-            .into_iter()
-            .map(|(_, levels)| levels.len())
-            .sum();
+            .asks.into_values().map(|levels| levels.len()).sum();
         let checksum = orderbook
             .map
             .values()

@@ -24,6 +24,10 @@ pub enum Side {
     Bid,
     Ask,
 }
+pub enum Either<Iter1, Iter2> {
+    Ascending(Iter1),
+    Descending(Iter2),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackPressureStrategy {
@@ -61,5 +65,19 @@ impl Order {
 impl<T> From<T> for Command<T> {
     fn from(op: T) -> Self {
         Command::Operation(op)
+    }
+}
+
+impl<'a, Iter1, Iter2, K: 'a, V: 'a> Iterator for Either<Iter1, Iter2>
+where
+    Iter1: Iterator<Item = (&'a K, &'a V)>,
+    Iter2: Iterator<Item = (&'a K, &'a V)>,
+{
+    type Item = (&'a K, &'a V);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Either::Ascending(iter) => iter.next(),
+            Either::Descending(iter) => iter.next(),
+        }
     }
 }
