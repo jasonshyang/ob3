@@ -43,7 +43,11 @@ pub enum Command<T> {
 
 #[derive(Debug, Clone)]
 pub enum Query<T> {
-    GetSnapshot(crossbeam_channel::Sender<T>),
+    GetSimpleSnapshot(crossbeam_channel::Sender<T>),
+    GetTopNLevels {
+        n: usize,
+        sender: crossbeam_channel::Sender<T>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +55,34 @@ pub enum Op {
     Add(Order),
     Remove(u64),
     Modify { oid: u64, size: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub enum OrderbookSnapshot {
+    Simple(SimpleSnapshot),
+    TopNLevels(TopNLevels),
+}
+
+#[derive(Debug, Clone)]
+pub struct SimpleSnapshot {
+    pub total_orders: usize,
+    pub total_bids: usize,
+    pub total_asks: usize,
+    pub checksum: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TopNLevels {
+    pub n: usize,
+    pub bids: Vec<Level>,
+    pub asks: Vec<Level>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Level {
+    pub price: u64,
+    pub total_size: u64,
+    pub total_count: usize,
 }
 
 impl Order {
@@ -68,6 +100,7 @@ impl<T> From<T> for Command<T> {
     }
 }
 
+// We use this to allow iterating over two different iterators in a single loop
 impl<'a, Iter1, Iter2, K: 'a, V: 'a> Iterator for Either<Iter1, Iter2>
 where
     Iter1: Iterator<Item = (&'a K, &'a V)>,
@@ -78,6 +111,24 @@ where
         match self {
             Either::Ascending(iter) => iter.next(),
             Either::Descending(iter) => iter.next(),
+        }
+    }
+}
+
+impl OrderbookSnapshot {
+    pub fn as_simple(&self) -> Option<&SimpleSnapshot> {
+        if let OrderbookSnapshot::Simple(snapshot) = self {
+            Some(snapshot)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_top_n_levels(&self) -> Option<&TopNLevels> {
+        if let OrderbookSnapshot::TopNLevels(snapshot) = self {
+            Some(snapshot)
+        } else {
+            None
         }
     }
 }

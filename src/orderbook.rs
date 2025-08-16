@@ -1,8 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use rayon::{
+    iter::{IntoParallelRefIterator, ParallelIterator as _},
+    slice::ParallelSlice as _,
+};
+
 use crate::{
     error::Error,
-    types::{BatchProcessor, Either, Op, Order, Query, Side},
+    types::{
+        BatchProcessor, Either, Level, Op, Order, OrderbookSnapshot, Query, Side, SimpleSnapshot,
+        TopNLevels,
+    },
 };
 
 /*
@@ -17,30 +25,26 @@ pub struct Orderbook {
     pub asks: BTreeMap<u64, BTreeSet<u64>>, // price => level
 }
 
-#[derive(Debug, Clone)]
-pub struct OrderbookSnapshot {
-    pub total_orders: usize,
-    pub total_bids: usize,
-    pub total_asks: usize,
-    pub checksum: u64,
-}
-
 impl BatchProcessor for Orderbook {
     type Operation = Op;
     type Snapshot = OrderbookSnapshot;
 
     // TODO: right now it's a very naive implementation, we can optimize it later
-    fn process_ops(&mut self, ops: Vec<Self::Operation>) {
+    fn process_ops(&mut self, ops: Vec<Op>) {
         for op in ops {
             self.process_op(op);
         }
     }
 
-    fn process_query(&self, query: crate::types::Query<Self::Snapshot>) -> Result<(), Error> {
-        let snapshot: OrderbookSnapshot = self.clone().into();
+    fn process_query(&self, query: Query<OrderbookSnapshot>) -> Result<(), Error> {
         match query {
-            Query::GetSnapshot(sender) => {
-                sender.send(snapshot)?;
+            Query::GetSimpleSnapshot(sender) => {
+                sender.send(OrderbookSnapshot::Simple(self.generate_simple_snapshot()))?;
+            }
+            Query::GetTopNLevels { n, sender } => {
+                sender.send(OrderbookSnapshot::TopNLevels(
+                    self.generate_level_snapshot(n),
+                ))?;
             }
         }
 
@@ -49,6 +53,67 @@ impl BatchProcessor for Orderbook {
 }
 
 impl Orderbook {
+    const CHUNK: usize = 1024;
+
+    pub fn generate_simple_snapshot(&self) -> SimpleSnapshot {
+        let total_orders = self.map.len();
+        let total_bids = self.bids.values().map(|levels| levels.len()).sum();
+        let total_asks = self.asks.values().map(|levels| levels.len()).sum();
+        let checksum = self
+            .map
+            .values()
+            .fold(0u64, |acc, order| acc.wrapping_add(order.oid));
+
+        SimpleSnapshot {
+            total_orders,
+            total_bids,
+            total_asks,
+            checksum,
+        }
+    }
+
+    pub fn generate_level_snapshot(&self, n: usize) -> TopNLevels {
+        let (bids, asks) = rayon::join(
+            || self.generate_level_snapshot_for_side(Side::Bid, n),
+            || self.generate_level_snapshot_for_side(Side::Ask, n),
+        );
+
+        TopNLevels { n, bids, asks }
+    }
+
+    pub fn generate_level_snapshot_for_side(&self, side: Side, n: usize) -> Vec<Level> {
+        // We want to give the response in best price order
+        let iter = match side {
+            Side::Ask => Either::Ascending(self.asks.iter()),
+            Side::Bid => Either::Descending(self.bids.iter().rev()),
+        };
+
+        let top_levels_ref: Vec<(u64, &BTreeSet<u64>)> =
+            iter.take(n).map(|(p, s)| (*p, s)).collect();
+
+        top_levels_ref
+            .par_iter()
+            .map(|(price, oids_set)| {
+                let oids: Vec<u64> = oids_set.iter().cloned().collect();
+
+                let (total_size, total_count) = if oids.len() < Self::CHUNK {
+                    self.summarize_level(&oids)
+                } else {
+                    oids.par_chunks(Self::CHUNK)
+                        .map(|c| self.summarize_level(c))
+                        .reduce_with(|a, b| (a.0 + b.0, a.1 + b.1))
+                        .unwrap_or((0, 0))
+                };
+
+                Level {
+                    price: *price,
+                    total_size,
+                    total_count,
+                }
+            })
+            .collect()
+    }
+
     pub fn get(&self, oid: u64) -> Option<&Order> {
         self.map.get(&oid)
     }
@@ -159,26 +224,16 @@ impl Orderbook {
             order.size = size;
         }
     }
-}
 
-impl From<Orderbook> for OrderbookSnapshot {
-    fn from(orderbook: Orderbook) -> Self {
-        let total_orders = orderbook.map.len();
-        let total_bids = orderbook
-            .bids.into_values().map(|levels| levels.len()).sum();
-        let total_asks = orderbook
-            .asks.into_values().map(|levels| levels.len()).sum();
-        let checksum = orderbook
-            .map
-            .values()
-            .fold(0u64, |acc, order| acc.wrapping_add(order.oid));
-
-        OrderbookSnapshot {
-            total_orders,
-            total_bids,
-            total_asks,
-            checksum,
-        }
+    fn summarize_level(&self, oids: &[u64]) -> (u64, usize) {
+        let total_size = oids.iter().fold(0, |acc, oid| {
+            if let Some(order) = self.map.get(oid) {
+                acc + order.size
+            } else {
+                acc
+            }
+        });
+        (total_size, oids.len())
     }
 }
 
@@ -267,5 +322,82 @@ mod tests {
         assert!(!orderbook.contains(2)); // oid 2 should be fully filled and removed
         assert!(orderbook.contains(6)); // oid 6 should be added to bids
         assert_eq!(orderbook.get(6).unwrap().size, 10); // oid 6 should have 10 left
+    }
+
+    #[test]
+    fn test_top_n_level_summary() {
+        let mut orderbook = Orderbook::default();
+
+        let orders = vec![
+            Order {
+                oid: 1,
+                price: 100,
+                size: 15,
+                side: Side::Bid,
+                timestamp: 0,
+            },
+            Order {
+                oid: 2,
+                price: 101,
+                size: 5,
+                side: Side::Ask,
+                timestamp: 1,
+            },
+            Order {
+                oid: 3,
+                price: 98,
+                size: 15,
+                side: Side::Bid,
+                timestamp: 2,
+            },
+            Order {
+                oid: 4,
+                price: 102,
+                size: 10,
+                side: Side::Ask,
+                timestamp: 3,
+            },
+            Order {
+                oid: 5,
+                price: 100,
+                size: 20,
+                side: Side::Bid,
+                timestamp: 4,
+            },
+        ];
+
+        for order in orders {
+            orderbook.add(order);
+        }
+
+        /*
+        Orderbook state (none of the orders are crossing so the orders should remain same)
+        bids: {98: {3}, 100: {1, 5}}, asks: {101: {2}, 102: {4}}
+        */
+
+        let snapshot = orderbook.generate_level_snapshot(3);
+        assert_eq!(snapshot.n, 3);
+        assert_eq!(snapshot.bids.len(), 2);
+        assert_eq!(snapshot.asks.len(), 2);
+
+        // Check bids
+        // First level should be the highest bid, total size 15, total count 1
+        assert_eq!(snapshot.bids[0].price, 100);
+        assert_eq!(snapshot.bids[0].total_size, 35);
+        assert_eq!(snapshot.bids[0].total_count, 2);
+        // Second level should be the second highest bid, total size 15, total count 1
+        assert_eq!(snapshot.bids[1].price, 98);
+        assert_eq!(snapshot.bids[1].total_size, 15);
+        assert_eq!(snapshot.bids[1].total_count, 1);
+
+        // Check asks
+        // First level should be the lowest ask, total size 5, total count 1
+        assert_eq!(snapshot.asks[0].price, 101);
+        assert_eq!(snapshot.asks[0].total_size, 5);
+        assert_eq!(snapshot.asks[0].total_count, 1);
+        // Second level should be the second lowest ask, total size 10, total count 1
+        assert_eq!(snapshot.asks[1].price, 102);
+        assert_eq!(snapshot.asks[1].total_size, 10);
+        assert_eq!(snapshot.asks[1].total_count, 1);
     }
 }

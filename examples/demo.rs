@@ -3,15 +3,13 @@ use std::io::Write as _;
 use ob3::{
     ingress::spawn_processor_thread,
     orderbook::Orderbook,
-    types::{BackPressureStrategy, Command, Op, Order, Side},
+    types::{BackPressureStrategy, Command, Op, Order, Query, Side},
 };
 
 // Our nice looking spinner
 const SPINNER: &[&str] = &["|", "/", "-", "\\"];
 
 // ---- Config for ob3 (change this to test different strategies) ----
-// The query channel size
-const QUERY_CHANNEL_SIZE: usize = 100;
 // The maximum delay in milliseconds for processing commands
 const MAX_DELAY_MS: u64 = 50;
 // The size of the ingress command buffer channel.
@@ -20,6 +18,14 @@ const BUFFER_SIZE: usize = 1_000;
 const BATCH_SIZE: usize = 100;
 // The strategy to use when the command buffer is full.
 const BACK_PRESSURE_STRATEGY: BackPressureStrategy = BackPressureStrategy::Block;
+
+// ---- Config for query (change this to test different query frequency) ----
+// The query channel size
+const QUERY_CHANNEL_SIZE: usize = 10;
+// The frequency of queries in milliseconds
+const QUERY_FREQUENCY_MS: u64 = 500;
+// The level of book to query
+const QUERY_LEVEL: usize = 1000;
 
 // ---- Config for volume (change this to simulate different scenarios) ----
 // Total number of operations to process
@@ -60,6 +66,10 @@ async fn main() {
 
     let start = std::time::Instant::now();
     println!("Starting to process {} operations...", ops.len());
+    println!(
+        "(Querying top {} levels every {} ms)",
+        QUERY_LEVEL, QUERY_FREQUENCY_MS
+    );
 
     // Spawn a task to send commands to the processor thread for consumption
     let producer_task = tokio::spawn(async move {
@@ -101,7 +111,29 @@ async fn main() {
         }
     });
 
-    // Wait for the producer and sender tasks to complete
+    let sender = query_sender.clone();
+    // Spawn a task to periodically query the orderbook
+    let _ = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(QUERY_FREQUENCY_MS)).await;
+
+            let (query_tx, query_rx) = crossbeam_channel::unbounded();
+            let query = Query::GetTopNLevels {
+                n: QUERY_LEVEL,
+                sender: query_tx,
+            };
+
+            // End the task loop after the processor thread is done (which closes the channel)
+            if sender.send(query).is_err() {
+                break;
+            }
+
+            // Block until we receive the snapshot
+            let _ = query_rx.recv().expect("Failed to receive query response");
+        }
+    });
+
+    // Wait for the tasks to complete
     let _ = tokio::join!(producer_task, sender_task);
 
     let elapsed = start.elapsed();
@@ -111,13 +143,17 @@ async fn main() {
         ops_len as f64 / elapsed.as_secs_f64()
     );
 
-    let (oneshot_tx, oneshot_rx) = crossbeam_channel::bounded(1);
-    query_sender
-        .send(ob3::types::Query::GetSnapshot(oneshot_tx))
-        .unwrap();
+    // Print the final snapshot
+    let (query_tx, query_rx) = crossbeam_channel::bounded(1);
+    let query = Query::GetSimpleSnapshot(query_tx);
+    query_sender.send(query).expect("Failed to send query");
+    let res = query_rx.recv().expect("Failed to receive snapshot");
+    let final_snapshot = res.as_simple().unwrap();
+    println!("Total orders in the book: {}", final_snapshot.total_orders);
+    println!("Total bids: {}", final_snapshot.total_bids);
+    println!("Total asks: {}", final_snapshot.total_asks);
+    println!("Checksum: {}", final_snapshot.checksum);
 
-    let snapshot = oneshot_rx.recv().unwrap();
-    println!("Orderbook snapshot: {:?}", snapshot);
     // Shutdown the processor thread
     controller.shutdown().unwrap();
     println!("Processor thread shutdown complete.");
