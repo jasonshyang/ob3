@@ -4,7 +4,7 @@ use crossbeam_channel::Sender;
 
 use crate::{
     error::Error,
-    types::{BackPressureStrategy, BatchProcessor, Command, Query},
+    types::{BackPressureStrategy, BatchProcessor, Command, ProcessorResult},
 };
 
 /*
@@ -26,9 +26,10 @@ pub struct Producer<T> {
     config: IngressConfig,
 }
 
+// P: Processor, T: Type of operation
 #[derive(Debug)]
-pub struct Controller<T> {
-    handle: Option<JoinHandle<()>>,
+pub struct Controller<P, T> {
+    handle: Option<JoinHandle<P>>,
     sender: Sender<Command<T>>,
 }
 
@@ -50,20 +51,22 @@ impl<T> Producer<T> {
     }
 }
 
-impl<T> Controller<T> {
-    pub fn shutdown(&mut self) -> Result<(), Error> {
+impl<P, T> Controller<P, T> {
+    pub fn shutdown(&mut self) -> Result<P, Error> {
         if let Some(handle) = self.handle.take() {
             self.sender.send(Command::Shutdown)?;
-            handle.join().map_err(|_| Error::JoinError)?;
+            let processor = handle.join().map_err(|_| Error::JoinError)?;
+            Ok(processor)
+        } else {
+            Err(Error::AlreadyShutdown)
         }
-        Ok(())
     }
 }
 
 pub fn spawn_processor_thread<P, T>(
     mut processor: P,
     config: IngressConfig,
-) -> (Producer<T>, Controller<T>, Sender<Query<P::Snapshot>>)
+) -> ProcessorResult<P, T, P::Snapshot>
 where
     P: BatchProcessor<Operation = T> + Send + 'static,
     T: Send + 'static,
@@ -79,9 +82,15 @@ where
             crossbeam_channel::select! {
                 recv(rx) -> command => match command {
                     Ok(Command::Shutdown) => {
+                        // Drain any remaining commands
+                        while let Ok(Command::Operation(op)) = rx.try_recv() {
+                            batch.push(op);
+                        }
+
                         if !batch.is_empty() {
                             processor.process_ops(std::mem::take(&mut batch));
                         }
+
                         break;
                     }
                     Ok(Command::Operation(op)) => {
@@ -108,6 +117,7 @@ where
                 last_flush = std::time::Instant::now();
             }
         }
+        processor
     });
 
     let controller = Controller {

@@ -6,6 +6,10 @@ pub enum Error {
     SendError(String),
     #[error("Couldn't join on the associated thread")]
     JoinError,
+    #[error("Order not found: {0}")]
+    OrderNotFound(String),
+    #[error("Already shutdown")]
+    AlreadyShutdown,
 }
 
 impl<T> From<crossbeam_channel::SendError<T>> for Error {

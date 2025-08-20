@@ -1,6 +1,13 @@
 use std::fmt::Debug;
 
-use crate::error::Error;
+use crossbeam_channel::Sender;
+
+use crate::{
+    error::Error,
+    ingress::{Controller, Producer},
+};
+
+pub type ProcessorResult<P, T, S> = (Producer<T>, Controller<P, T>, Sender<Query<S>>);
 
 pub trait BatchProcessor {
     type Operation;
@@ -11,8 +18,15 @@ pub trait BatchProcessor {
 }
 
 #[derive(Debug, Clone)]
+pub enum Op {
+    Add(Order),
+    Remove(String),
+    Modify { oid: String, size: u64 },
+}
+
+#[derive(Debug, Clone)]
 pub struct Order {
-    pub oid: u64,
+    pub oid: String,
     pub price: u64,
     pub size: u64,
     pub side: Side,
@@ -48,13 +62,6 @@ pub enum Query<T> {
         n: usize,
         sender: crossbeam_channel::Sender<T>,
     },
-}
-
-#[derive(Debug, Clone)]
-pub enum Op {
-    Add(Order),
-    Remove(u64),
-    Modify { oid: u64, size: u64 },
 }
 
 #[derive(Debug, Clone)]

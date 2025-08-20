@@ -2,9 +2,11 @@ use std::io::Write as _;
 
 use ob3::{
     ingress::spawn_processor_thread,
+    lcg::{Lcg, generate_random_ops},
     orderbook::Orderbook,
-    types::{BackPressureStrategy, Command, Op, Order, Query, Side},
+    types::{BackPressureStrategy, Command, Op, Query},
 };
+use tokio_util::sync::CancellationToken;
 
 // Our nice looking spinner
 const SPINNER: &[&str] = &["|", "/", "-", "\\"];
@@ -49,7 +51,13 @@ const SIZE_RANGE: (u64, u64) = (1_000, 1_000_000_000);
 async fn main() {
     let ops_len = INGRESS_NUM_TOTAL;
     // Generate a large number of random operations
-    let mut ops = generate_random_ops(OP_SEED, ops_len);
+    let mut ops = generate_random_ops(OP_SEED, ops_len, PRICE_RANGE, SIZE_RANGE);
+    let total_adds = ops.iter().filter(|op| matches!(op, Op::Add(_))).count();
+    let total_removes = ops.iter().filter(|op| matches!(op, Op::Remove(_))).count();
+    let total_modifies = ops
+        .iter()
+        .filter(|op| matches!(op, Op::Modify { .. }))
+        .count();
 
     // Create a channel for sending commands
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Command<Op>>(INGRESS_BATCH_RANGE.1 as usize);
@@ -67,36 +75,36 @@ async fn main() {
     let start = std::time::Instant::now();
     println!("Starting to process {} operations...", ops.len());
     println!(
+        "({} adds, {} removes, {} modifies)",
+        total_adds, total_removes, total_modifies
+    );
+    println!(
         "(Querying top {} levels every {} ms)",
         QUERY_LEVEL, QUERY_FREQUENCY_MS
     );
-
     // Spawn a task to send commands to the processor thread for consumption
     let producer_task = tokio::spawn(async move {
         while let Some(op) = rx.recv().await {
-            producer.send(op.into()).unwrap();
+            producer.send(op).unwrap();
         }
     });
 
     // Spawn a task to send the operations (to simulate network ingress)
+    let shutdown = CancellationToken::new();
+    let shutdown_signal = shutdown.clone();
     let sender_task = tokio::spawn(async move {
         let mut lcg = Lcg {
             seed: INGRESS_BATCH_SIZE_SEED,
         };
 
         for i in 0..ops_len {
-            let batch_size = lcg.next_range(INGRESS_BATCH_RANGE.0, INGRESS_BATCH_RANGE.1) as usize;
+            let batch_size =
+                lcg.next_rand_in_range(INGRESS_BATCH_RANGE.0, INGRESS_BATCH_RANGE.1) as usize;
 
-            print!(
-                "\r{} Sending {} operations...",
-                SPINNER[i % SPINNER.len()],
-                batch_size
-            );
+            print!("\r{}", SPINNER[i % SPINNER.len()]);
             std::io::stdout().flush().unwrap();
-            let split = ops.len().saturating_sub(batch_size);
-            let batch = ops.split_off(split);
-
-            for op in batch {
+            let split = ops.len().min(batch_size);
+            for op in ops.drain(..split) {
                 tx.send(Command::Operation(op)).await.unwrap();
             }
 
@@ -109,32 +117,40 @@ async fn main() {
                     .await;
             }
         }
+
+        shutdown_signal.cancel();
     });
 
-    let sender = query_sender.clone();
     // Spawn a task to periodically query the orderbook
-    let _ = tokio::spawn(async move {
+    let sender = query_sender.clone();
+    let query_task = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(QUERY_FREQUENCY_MS)).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    println!("\nShutdown signal received, stopping query task.");
+                    break;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(QUERY_FREQUENCY_MS)) => {
+                    let (query_tx, query_rx) = crossbeam_channel::unbounded();
+                    let query = Query::GetTopNLevels {
+                        n: QUERY_LEVEL,
+                        sender: query_tx,
+                    };
 
-            let (query_tx, query_rx) = crossbeam_channel::unbounded();
-            let query = Query::GetTopNLevels {
-                n: QUERY_LEVEL,
-                sender: query_tx,
-            };
+                    // End the task loop after the processor thread is done (which closes the channel)
+                    if sender.send(query).is_err() {
+                        break;
+                    }
 
-            // End the task loop after the processor thread is done (which closes the channel)
-            if sender.send(query).is_err() {
-                break;
+                    // Block until we receive the snapshot
+                    let _ = query_rx.recv().expect("Failed to receive query response");
+                }
             }
-
-            // Block until we receive the snapshot
-            let _ = query_rx.recv().expect("Failed to receive query response");
         }
     });
 
     // Wait for the tasks to complete
-    let _ = tokio::join!(producer_task, sender_task);
+    let _ = tokio::join!(producer_task, sender_task, query_task);
 
     let elapsed = start.elapsed();
     println!("\rTotal time taken: {:?}", elapsed);
@@ -143,79 +159,14 @@ async fn main() {
         ops_len as f64 / elapsed.as_secs_f64()
     );
 
+    // Shutdown the processor thread
+    let orderbook = controller.shutdown().unwrap();
+
     // Print the final snapshot
-    let (query_tx, query_rx) = crossbeam_channel::bounded(1);
-    let query = Query::GetSimpleSnapshot(query_tx);
-    query_sender.send(query).expect("Failed to send query");
-    let res = query_rx.recv().expect("Failed to receive snapshot");
-    let final_snapshot = res.as_simple().unwrap();
+    let final_snapshot = orderbook.generate_simple_snapshot();
     println!("Total orders in the book: {}", final_snapshot.total_orders);
     println!("Total bids: {}", final_snapshot.total_bids);
     println!("Total asks: {}", final_snapshot.total_asks);
     println!("Checksum: {}", final_snapshot.checksum);
-
-    // Shutdown the processor thread
-    controller.shutdown().unwrap();
     println!("Processor thread shutdown complete.");
-}
-
-struct Lcg {
-    pub seed: u64,
-}
-
-impl Lcg {
-    fn next(&mut self) -> u64 {
-        // Linear Congruential Generator parameters
-        const A: u64 = 6364136223846793005;
-        const C: u64 = 1;
-        const M: u64 = 1 << 48; // 2^48
-
-        self.seed = (A.wrapping_mul(self.seed).wrapping_add(C)) % M;
-        self.seed
-    }
-
-    fn next_range(&mut self, min: u64, max: u64) -> u64 {
-        let range = max - min;
-        min + (self.next() % range)
-    }
-}
-
-fn generate_random_ops(seed: u64, count: usize) -> Vec<Op> {
-    let mut ops = Vec::with_capacity(count);
-    let mut lcg = Lcg { seed };
-    for i in 0..count {
-        let op_type = lcg.next_range(0, 3); // 0: Add, 1: Remove, 2: Modify
-
-        match op_type {
-            0 => {
-                // Add
-                let order = Order {
-                    oid: i as u64,
-                    price: lcg.next_range(PRICE_RANGE.0, PRICE_RANGE.1),
-                    size: lcg.next_range(SIZE_RANGE.0, SIZE_RANGE.1),
-                    side: if lcg.next() % 2 == 0 {
-                        Side::Bid
-                    } else {
-                        Side::Ask
-                    },
-                    timestamp: lcg.next(),
-                };
-                ops.push(Op::Add(order));
-            }
-            1 => {
-                // Remove
-                let oid = lcg.next_range(0, i as u64);
-                ops.push(Op::Remove(oid));
-            }
-            2 => {
-                // Modify
-                let oid = lcg.next_range(0, i as u64);
-                let size = lcg.next_range(SIZE_RANGE.0, SIZE_RANGE.1);
-                ops.push(Op::Modify { oid, size });
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    ops
 }
